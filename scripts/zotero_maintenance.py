@@ -146,6 +146,51 @@ def apply_merge(api, plan, trash):
             print("Trashed", record["key"], flush=True)
 
 
+
+def masked_key(prompt="Zotero API key: "):
+    """Mask ASCII API-key input on POSIX terminals, including pasted input."""
+    if os.name != "posix":
+        return getpass.getpass(prompt)
+    import termios
+    import tty
+    try:
+        terminal = open("/dev/tty", "r+", encoding="utf-8", buffering=1)
+    except OSError:
+        return getpass.getpass(prompt)
+    with terminal:
+        fd = terminal.fileno()
+        original = termios.tcgetattr(fd)
+        chars = []
+        terminal.write(prompt)
+        terminal.flush()
+        try:
+            tty.setraw(fd)
+            while True:
+                byte = os.read(fd, 1)
+                if byte in (b"\r", b"\n"):
+                    return "".join(chars)
+                if byte in (b"\x03", b"\x04", b""):
+                    raise KeyboardInterrupt
+                if byte in (b"\x08", b"\x7f"):
+                    if chars:
+                        chars.pop()
+                        terminal.write("\b \b")
+                elif byte == b"\x15":
+                    terminal.write("\b \b" * len(chars))
+                    chars.clear()
+                elif byte.isalnum():
+                    chars.append(byte.decode("ascii"))
+                    terminal.write("●")
+                else:
+                    # Reject unexpected characters rather than silently changing a key.
+                    raise ValueError("Unexpected character in Zotero API key")
+                terminal.flush()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, original)
+            terminal.write("\n")
+            terminal.flush()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--group", required=True, type=int)
@@ -164,7 +209,7 @@ def main():
         parser.error("Invalid group ID or item key")
     if args.command == "merge" and (len(keys) < 2 or len(set(keys)) != len(keys)):
         parser.error("Supply at least two distinct item keys")
-    token = os.environ.get("ZOTERO_API_KEY") or getpass.getpass("Zotero API key: ")
+    token = os.environ.get("ZOTERO_API_KEY") or masked_key()
     api = Zotero(args.group, token)
     if args.command == "merge":
         plan = plan_merge(api, keys)
