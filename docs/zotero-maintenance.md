@@ -79,4 +79,6 @@ On 25 November 2026, the preview found 19 duplicate-note groups with 30 redundan
 
 This experimental utility requires testing with disposable group records before use on production research. It does not add write tools to ChatGPT; deployment of a write-enabled MCP interface would be separate.
 
+See [Archive AI-use evidence in Zotero](zotero-ai-evidence.md) for the separate import workflow.
+
 API reference: https://www.zotero.org/support/dev/web_api/v3/write_requests
