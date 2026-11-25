@@ -7,7 +7,9 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -101,10 +103,12 @@ def chatgpt_transcript(raw, conversation_id):
     exported = json.loads(raw)
     conversations = exported if isinstance(exported, list) else [exported]
     selected = [c for c in conversations if isinstance(c, dict)
-                and (c.get("id") or c.get("conversation_id")) == conversation_id]
-    if len(selected) != 1:
+                and (conversation_id is None or (c.get("id") or c.get("conversation_id")) == conversation_id)]
+    if len(selected) != 1 or not all(isinstance(c, dict) for c in conversations):
         raise ValueError("Select exactly one ChatGPT conversation by its exported ID")
     conversation = selected[0]
+    if "mapping" not in conversation:
+        return manual_json_transcript("ChatGPT", conversation)
     mapping = conversation["mapping"]
     key = conversation["current_node"]
     seen, models, messages = set(), set(), []
@@ -133,17 +137,107 @@ def chatgpt_transcript(raw, conversation_id):
                              None, reversed(messages))
 
 
+def manual_json_transcript(source, document):
+    rows = document.get("messages")
+    if not isinstance(rows, list):
+        raise ValueError("Expected a conversation with a mapping or messages array")
+    messages, models = [], set()
+    if isinstance(document.get("model"), str):
+        models.add(document["model"])
+    for message in rows:
+        if not isinstance(message, dict) or message.get("role") not in ("user", "assistant"):
+            continue
+        if isinstance(message.get("model"), str):
+            models.add(message["model"])
+        if isinstance(message.get("content"), str):
+            messages.append((message.get("timestamp"), message["role"], message["content"]))
+    if not messages:
+        raise ValueError("No user or assistant text found in the conversation")
+    return render_transcript(source, document.get("date") or document.get("timestamp"), sorted(models),
+                             document.get("cli_version"), messages)
+
+
 def utc_time(value):
     return datetime.fromtimestamp(value, timezone.utc).isoformat() if value is not None else None
 
 
 def render_transcript(source, date, models, cli, messages):
-    chunks = [f"{source} interaction record", f"Session date: {date or 'Unavailable'}",
-              f"Recorded model identifiers: {', '.join(models) or 'Unavailable'}",
-              f"Recorded CLI version: {cli or 'Unavailable'}"]
+    chunks = [f"{source} interaction record", f"Session date: {date or 'Unverified'}",
+              f"Recorded model identifiers: {', '.join(models) or 'Unverified'}",
+              f"Recorded CLI version: {cli or 'Unverified'}"]
     for timestamp, role, body in messages:
-        chunks.extend(["", f"[{timestamp or 'Timestamp unavailable'}] {role}", body])
+        chunks.extend(["", f"[{timestamp or 'Timestamp unverified'}] {role}", body])
     return "\n".join(chunks) + "\n"
+
+
+MODEL_LINE = re.compile(r"(?im)^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*)?(?:model(?: identifier| id)?|model_slug)[ \t]*(?:\*\*)?:[ \t]*(?:\*\*)?([^\r\n]+)")
+DATE_LINE = re.compile(r"(?im)^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*)?(?:date|session date|interaction date|timestamp)[ \t]*(?:\*\*)?:[ \t]*(?:\*\*)?([^\r\n]+)")
+CLI_LINE = re.compile(r"(?im)^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*)?(?:codex )?cli version[ \t]*(?:\*\*)?:[ \t]*(?:\*\*)?([^\r\n]+)")
+PROMPT_LINE = re.compile(r"(?im)^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*)?(?:user|you said|prompt)(?:\*\*)?[ \t]*(?::|$)")
+
+
+def explicit_values(pattern, text):
+    return list(dict.fromkeys(value.strip().strip("*`").strip() for value in pattern.findall(text)
+                              if value.strip().strip("*`").strip()))
+
+
+def manual_transcript(kind, text):
+    models = explicit_values(MODEL_LINE, text)
+    dates = explicit_values(DATE_LINE, text)
+    versions = explicit_values(CLI_LINE, text)
+    prompts = len(PROMPT_LINE.findall(text))
+    label = {"chatgpt": "ChatGPT", "codex": "Codex", "maintenance": "Maintenance",
+             "compliance": "Compliance"}[kind]
+    return (f"{label} evidence from a manually supplied file\n"
+            f"Model identifiers labeled in source: {', '.join(models) or 'Unverified'}\n"
+            f"Interaction dates labeled in source: {', '.join(dates) or 'Unverified'}\n"
+            f"CLI versions labeled in source: {', '.join(versions) or 'Unverified'}\n"
+            f"Prompt headings found: {prompts or 'Unverified'}\n\n"
+            "Source text (review relevant prompts and redact before approving)\n\n"
+            + text)
+
+
+def extract_pdf(raw):
+    try:
+        with tempfile.TemporaryFile() as output:
+            subprocess.run(["pdftotext", "-layout", "-enc", "UTF-8", "-", "-"], input=raw,
+                           stdout=output, stderr=subprocess.DEVNULL, timeout=60, check=True)
+            output.seek(0)
+            text = output.read(MAX_BYTES + 1).decode("utf-8")
+    except FileNotFoundError as error:
+        raise ValueError("PDF extraction requires pdftotext (Poppler)") from error
+    except (subprocess.SubprocessError, UnicodeDecodeError) as error:
+        raise ValueError("Could not extract PDF text; supply a readable TXT or Markdown copy") from error
+    if len(text.encode()) > MAX_BYTES:
+        raise ValueError("PDF text exceeds the 10 MiB evidence limit")
+    if not text.strip():
+        raise ValueError("PDF has no extractable text; supply an OCR-reviewed TXT copy")
+    return text.replace("\f", "\n")
+
+
+def render_input(kind, source, raw, conversation_id):
+    suffix = source.suffix.lower()
+    if kind == "codex" and suffix == ".jsonl":
+        return codex_transcript(raw)
+    if suffix == ".json":
+        if kind == "chatgpt":
+            return chatgpt_transcript(raw, conversation_id)
+        document = json.loads(raw)
+        if kind == "codex" and isinstance(document, dict) and "messages" in document:
+            return manual_json_transcript("Codex", document)
+        text = json.dumps(document, ensure_ascii=False, indent=2) + "\n"
+        if isinstance(document, dict):
+            label = {"time": "Date", "timestamp": "Date", "model": "Model", "cli_version": "CLI version"}
+            fields = [f"{shown}: {document[field]}" for field, shown in label.items()
+                      if isinstance(document.get(field), str)]
+            if fields:
+                text = "\n".join(fields) + "\n\n" + text
+        return manual_transcript(kind, text)
+    if suffix == ".pdf":
+        return manual_transcript(kind, extract_pdf(raw))
+    if suffix not in (".txt", ".md", ".markdown", ".log", ""):
+        raise ValueError("Unsupported evidence format; use PDF, TXT, Markdown, JSON, or a Codex JSONL rollout")
+    return manual_transcript(kind, raw.decode("utf-8-sig"))
 
 
 def private_file(path, data):
@@ -155,13 +249,7 @@ def private_file(path, data):
 
 def prepare(kind, source, directory, conversation_id):
     raw = read_limited(source, MAX_SOURCE_BYTES)
-    if kind == "codex":
-        rendered = codex_transcript(raw)
-    elif kind == "chatgpt":
-        rendered = chatgpt_transcript(raw, conversation_id)
-    else:
-        rendered = (json.dumps(json.loads(raw), ensure_ascii=False, indent=2) + "\n"
-                    if source.suffix.lower() == ".json" else raw.decode("utf-8"))
+    rendered = render_input(kind, source, raw, conversation_id)
     directory.mkdir(mode=0o700)
     private_file(directory / "original.private", raw)
     private_file(directory / "review.txt", redact(rendered).encode("utf-8"))
@@ -204,7 +292,10 @@ class Evidence:
 
 
 def load_plan(manifest):
-    entries = json.loads(read_limited(manifest))
+    return validate_entries(manifest, json.loads(read_limited(manifest)))
+
+
+def validate_entries(manifest, entries):
     if not isinstance(entries, list) or not entries:
         raise ValueError("Manifest must be a nonempty JSON array")
     result, seen = [], set()
@@ -228,6 +319,20 @@ def load_plan(manifest):
                 raise ValueError("Evidence or metadata contains a possible secret, identifier or control character")
         result.append(Evidence(entry["category"], entry["title"], entry["activity"], digest, data))
     return sorted(result, key=lambda item: item.digest)
+
+
+def write_manifest(manifest, rows):
+    entries = []
+    for category, filename, title, activity in rows:
+        path = Path(filename).absolute()
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("Reviewed evidence must be a regular file")
+        entries.append({"category": category, "file": os.path.relpath(path, manifest.parent),
+                        "title": title, "activity": activity, "sha256": sha(read_limited(path))})
+    evidence = validate_entries(manifest, entries)
+    entries.sort(key=lambda entry: entry["sha256"])
+    private_file(manifest, (json.dumps(entries, ensure_ascii=False, indent=2) + "\n").encode())
+    return evidence
 
 
 def preview(evidence):
@@ -415,6 +520,10 @@ def main():
     prep.add_argument("source", type=Path)
     prep.add_argument("directory", type=Path)
     prep.add_argument("--conversation-id")
+    manifest = commands.add_parser("manifest", help="Index and hash explicitly reviewed text files")
+    manifest.add_argument("path", type=Path)
+    manifest.add_argument("--entry", action="append", required=True, nargs=4,
+                          metavar=("CATEGORY", "FILE", "TITLE", "ACTIVITY"))
     archive = commands.add_parser("archive", help="Preview or import a reviewed manifest")
     archive.add_argument("manifest", type=Path)
     archive.add_argument("--apply", metavar="PLAN_SHA256")
@@ -425,9 +534,13 @@ def main():
         codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
         discover(args.root or [codex_home / "sessions", codex_home / "archived_sessions"], args.match)
     elif args.command == "prepare":
-        if args.kind == "chatgpt" and not args.conversation_id:
-            parser.error("ChatGPT preparation requires --conversation-id")
+        if args.conversation_id and (args.kind != "chatgpt" or args.source.suffix.lower() != ".json"):
+            parser.error("--conversation-id is only for ChatGPT JSON exports")
         prepare(args.kind, args.source, args.directory, args.conversation_id)
+    elif args.command == "manifest":
+        evidence = write_manifest(args.path, args.entry)
+        print(json.dumps(preview(evidence), ensure_ascii=False, indent=2))
+        print("Private manifest saved. No Zotero requests were made.")
     else:
         if not math.isfinite(args.timeout) or args.timeout <= 0 or args.max_retries < 0:
             parser.error("Timeout must be positive and retries nonnegative")

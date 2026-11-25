@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -74,9 +75,57 @@ class PreparationTests(unittest.TestCase):
         self.assertIn("1970-01-01T00:00:00+00:00", text)
         self.assertIn("Exact\nquestion", text)
         self.assertIn("Exact answer", text)
-        self.assertIn("Recorded CLI version: Unavailable", text)
+        self.assertIn("Recorded CLI version: Unverified", text)
         for value in ("Hidden", "Tool payload", "Abandoned branch", "Private"):
             self.assertNotIn(value, text)
+
+
+    def test_manual_markdown_and_backup_capture_explicit_metadata(self):
+        markdown = b"**Model:** o3-exact\nDate: 2026-10-05\n## User\nExact prompt\n## Assistant\nAnswer\n"
+        report = archive.render_input("codex", Path("manual.md"), markdown, None)
+        for value in ("o3-exact", "2026-10-05", "Prompt headings found: 1", "Exact prompt", "Unverified"):
+            self.assertIn(value, report)
+        plain = archive.render_input("chatgpt", Path("manual.txt"), b"No metadata here", None)
+        self.assertIn("Model identifiers labeled in source: Unverified", plain)
+        backup = archive.render_input("maintenance", Path("backup.json"),
+                                      encoded({"time": "2026-10-07T12:00:00Z", "groups": []}), None)
+        self.assertIn("Interaction dates labeled in source: 2026-10-07T12:00:00Z", backup)
+
+    def test_manual_json_omits_nonconversation_roles_and_requires_selection_for_multiple(self):
+        entry = {"date": "2026-10-05", "model": "test-model", "messages": [
+            {"role": "developer", "content": "Excluded"},
+            {"role": "user", "content": "Preserved prompt"},
+        ]}
+        text = archive.render_input("chatgpt", Path("manual.json"), encoded(entry), None)
+        self.assertIn("Preserved prompt", text)
+        self.assertNotIn("Excluded", text)
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            archive.render_input("chatgpt", Path("mixed.json"), encoded([entry, entry]), None)
+
+    @unittest.skipUnless(shutil.which("pdftotext"), "Requires Poppler")
+    def test_text_pdf_is_extracted_with_poppler(self):
+        stream = b"BT /F1 12 Tf 40 150 Td (Model: pdf-model) Tj 0 -20 Td (User: Exact PDF prompt) Tj ET"
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents 4 0 R "
+            b"/Resources << /Font << /F1 5 0 R >> >> >>",
+            b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        ]
+        pdf = b"%PDF-1.4\n"
+        offsets = []
+        for number, obj in enumerate(objects, 1):
+            offsets.append(len(pdf))
+            pdf += b"%d 0 obj\n" % number + obj + b"\nendobj\n"
+        xref = len(pdf)
+        pdf += b"xref\n0 6\n0000000000 65535 f \n" + b"".join(
+            b"%010d 00000 n \n" % offset for offset in offsets)
+        pdf += b"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % xref
+        report = archive.render_input("chatgpt", Path("manual.pdf"), pdf, None)
+        self.assertIn("Model identifiers labeled in source: pdf-model", report)
+        self.assertIn("Exact PDF prompt", report)
+        self.assertNotIn("\f", report)
 
 
 class PlanTests(unittest.TestCase):
@@ -114,6 +163,18 @@ class PlanTests(unittest.TestCase):
                   redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), self.assertRaises(error)):
                 archive.main()
             network.assert_not_called()
+
+    def test_manifest_builder_hashes_reviewed_files_and_refuses_overwrite(self):
+        reviewed = self.root / "review.txt"
+        reviewed.write_bytes(b"Reviewed attachment")
+        rows = [("maintenance", str(reviewed), "Maintenance run", "Verify the recovery")]
+        evidence = archive.write_manifest(self.manifest, rows)
+        self.assertEqual(evidence, archive.load_plan(self.manifest))
+        self.assertEqual(json.loads(self.manifest.read_text())[0]["file"], "review.txt")
+        if os.name == "posix":
+            self.assertEqual(stat.S_IMODE(self.manifest.stat().st_mode), 0o600)
+        with self.assertRaises(FileExistsError):
+            archive.write_manifest(self.manifest, rows)
 
     def test_modified_files_and_duplicate_bytes_are_refused(self):
         self.write_plan(b"Reviewed")

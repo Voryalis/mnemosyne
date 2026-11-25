@@ -4,52 +4,45 @@
 
 ## Find and prepare sources
 
-Run discovery on the machine where Codex saved its local sessions. Filenames and recorded dates are candidate evidence for review. A keyword match alone is insufficient to establish relevance.
+Save each shared conversation as a local PDF, TXT, Markdown, or JSON file, or use the uploaded file's path in the managed workspace. You can prepare manually supplied Codex transcripts in the same formats, including native JSONL rollouts. Session directories are optional. If available, `discover --match MNEMOSYNE --match Zotero` can list candidate rollouts without printing messages.
 
-```sh
-python3 scripts/zotero_ai_evidence.py discover \
-  --match MNEMOSYNE --match Zotero --match 'Anhui Huiliao'
-```
-
-Discovery checks `sessions` and `archived_sessions` under `CODEX_HOME` or `~/.codex`. Repeat `--root` to supply other directories. The CLI prints candidate paths and dates without printing message text.
-
-Use a fresh staging directory outside the checkout, with a separate subdirectory per source:
+Use a fresh staging directory outside the checkout:
 
 ```sh
 mkdir -p -m 700 "$HOME/.local/share/mnemosyne/evidence"
-python3 scripts/zotero_ai_evidence.py prepare codex /path/to/rollout-SESSION.jsonl \
+python3 scripts/zotero_ai_evidence.py prepare chatgpt "$HOME/Downloads/chatgpt-export.pdf" \
+  "$HOME/.local/share/mnemosyne/evidence/chatgpt-session"
+python3 scripts/zotero_ai_evidence.py prepare codex "$HOME/Downloads/codex-transcript.md" \
   "$HOME/.local/share/mnemosyne/evidence/codex-session"
-
-python3 scripts/zotero_ai_evidence.py prepare chatgpt /path/to/conversations.json \
-  "$HOME/.local/share/mnemosyne/evidence/chatgpt-session" --conversation-id CONVERSATION_ID
-
-python3 scripts/zotero_ai_evidence.py prepare maintenance /path/to/execution.log \
+python3 scripts/zotero_ai_evidence.py prepare maintenance "$HOME/Downloads/zotero-backup.json" \
+  "$HOME/.local/share/mnemosyne/evidence/maintenance-backup"
+python3 scripts/zotero_ai_evidence.py prepare maintenance "$HOME/Downloads/zotero-execution.log" \
   "$HOME/.local/share/mnemosyne/evidence/maintenance-log"
 ```
 
-For a ChatGPT export ZIP, extract `conversations.json` privately and select one conversation by its exported ID. The renderer uses the active conversation branch and visible user and assistant text. Codex rendering extracts recorded model identifiers, CLI version, session date, and user and assistant text from the rollout. Fields absent from the export appear as unavailable. The renderers omit tool calls, tool output, hidden messages, and non-text attachments. Source files can be up to 128 MiB, and each approved text attachment can be up to 10 MiB.
+PDF extraction uses Poppler's `pdftotext` (for example, `sudo pacman -S poppler` on Arch Linux or `brew install poppler` on macOS). For scanned or image-only PDFs, supply a reviewed OCR text copy. PDF layout extraction can change wrapping, so check prompts against the original.
 
-For a maintenance JSON backup or compliance record, use `prepare maintenance` or `prepare compliance`. For Git evidence, make a text file from reviewed commit IDs and repository commit links, then prepare it as maintenance evidence. You can get an exact ID with `git rev-parse COMMIT`.
+For a ChatGPT export ZIP, extract `conversations.json` privately. With multiple conversations, add `--conversation-id ID` to select exactly one. Native ChatGPT JSON renders the active branch and visible user and assistant text. A manually saved JSON conversation can also use a `messages` array of objects with `role`, `content`, and optional `timestamp` and `model` strings, with optional top-level `id`, `date`, `model`, and `cli_version` fields. Native Codex JSONL extracts the metadata and messages recorded in the rollout. PDF, TXT, and Markdown preserve source text and summarize explicit metadata labels and prompt headings where present. Missing fields appear as **Unverified**. A label in a manual transcript is a source claim, with no independent verification of the underlying model or date. Source files can be up to 128 MiB, and each approved text attachment can be up to 10 MiB.
+
+For compliance records, use `prepare compliance`. To archive Git evidence, put reviewed commit IDs and repository links in a text file and prepare it as maintenance evidence.
 
 Each new source directory is private and contains an unchanged `original.private` and a separate readable `review.txt`. Keep originals and staging files outside Git. The redactor removes common credential patterns and some personal identifiers. Review every line of each draft, including transcript excerpts, note bodies, command output, links, and filenames embedded in text. Remove unrelated material and any confidential information the redactor missed. Approve only the reviewed text and metadata. Never add a raw export or backup to the manifest.
 
 ## Preview a reviewed import
 
-Calculate SHA-256 after editing each approved text file. Put the manifest outside Git, alongside the evidence directories. For example:
+After reviewing and editing each draft, generate the private manifest. Repeat `--entry` for each approved file and omit entries for any files you have yet to review.
 
-```json
-[
-  {
-    "category": "codex",
-    "title": "Codex-assisted maintenance verification",
-    "activity": "Ran regression tests for duplicate-note recovery",
-    "file": "codex-session/review.txt",
-    "sha256": "REPLACE_WITH_SHA256_OF_THE_REVIEWED_FILE"
-  }
-]
+```sh
+python3 scripts/zotero_ai_evidence.py manifest "$HOME/.local/share/mnemosyne/evidence/manifest.json" \
+  --entry chatgpt "$HOME/.local/share/mnemosyne/evidence/chatgpt-session/review.txt" \
+  "ChatGPT source audit" "Review bibliographic sources and claims" \
+  --entry codex "$HOME/.local/share/mnemosyne/evidence/codex-session/review.txt" \
+  "Codex maintenance session" "Develop and verify the Zotero maintenance workflow" \
+  --entry maintenance "$HOME/.local/share/mnemosyne/evidence/maintenance-log/review.txt" \
+  "Zotero execution log" "Record the maintenance outcome"
 ```
 
-Use `sha256sum codex-session/review.txt` on Linux or `shasum -a 256 codex-session/review.txt` on macOS. Categories are `chatgpt`, `codex`, `maintenance`, and `compliance`.
+The manifest command hashes the reviewed files and refuses to overwrite an existing manifest. Use a new manifest name if you change the reviewed files or metadata. To repeat the preview:
 
 ```sh
 python3 scripts/zotero_ai_evidence.py archive "$HOME/.local/share/mnemosyne/evidence/manifest.json"
