@@ -1,26 +1,87 @@
 #!/usr/bin/env python3
 """Opt-in Zotero Web API maintenance. Dry-run by default. Python 3.10+."""
 import argparse
+import errno
 import getpass
 import json
+import math
 import os
+import random
 import re
+import socket
+import ssl
 import sys
+import time
 import warnings
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from http.client import IncompleteRead
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError
 
 KEY = re.compile(r"^[A-Z0-9]{8}$")
 
 
+def progress(message):
+    print(message, file=sys.stderr, flush=True)
+
+
+def transient_error(error):
+    if isinstance(error, HTTPError):
+        return error.code == 429 or 500 <= error.code < 600
+    reason = error.reason if isinstance(error, URLError) else error
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return False
+    if isinstance(reason, (TimeoutError, ConnectionError, IncompleteRead)):
+        return True
+    if isinstance(reason, socket.gaierror):
+        return reason.errno == socket.EAI_AGAIN
+    if isinstance(reason, OSError) and reason.errno in {
+        errno.ETIMEDOUT, errno.ENETUNREACH, errno.EHOSTUNREACH,
+        errno.ENETDOWN, errno.ENETRESET,
+    }:
+        return True
+    # urllib can wrap a TLS handshake timeout as an SSL error or a string.
+    message = str(reason).lower()
+    return ("timed out" in message
+            and (isinstance(reason, (ssl.SSLError, str))
+                 or (isinstance(reason, OSError) and "handshake" in message)))
+
+
+def header_delay(value):
+    if value is None:
+        return 0
+    try:
+        return max(0, int(value))
+    except ValueError:
+        try:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            return max(0, (date - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+
 class Zotero:
-    def __init__(self, group, token):
+    def __init__(self, group, token, *, timeout=30, max_retries=4):
+        self.group = group
         self.base = f"https://api.zotero.org/groups/{group}"
         self.token = token
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.not_before = 0
 
-    def request(self, path, method="GET", data=None, version=None):
+    def observe_backoff(self, headers):
+        if headers:
+            delay = max(header_delay(headers.get("Backoff")),
+                        header_delay(headers.get("Retry-After")))
+            if delay:
+                self.not_before = max(self.not_before, time.monotonic() + delay)
+
+    def request(self, path, method="GET", data=None, version=None, *, with_headers=False):
         headers = {"Zotero-API-Key": self.token, "Zotero-API-Version": "3"}
         if version is not None:
             headers["If-Unmodified-Since-Version"] = str(version)
@@ -28,9 +89,115 @@ class Zotero:
         if data is not None:
             headers["Content-Type"] = "application/json"
             payload = json.dumps(data).encode()
-        with urlopen(Request(self.base + path, payload, headers, method=method), timeout=30) as response:
-            raw = response.read()
-            return json.loads(raw) if raw else None
+        request = Request(self.base + path, payload, headers, method=method)
+        retries = self.max_retries if method == "GET" else 0
+        for attempt in range(retries + 1):
+            delay = self.not_before - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            try:
+                with urlopen(request, timeout=self.timeout) as response:
+                    response_headers = getattr(response, "headers", {})
+                    self.observe_backoff(response_headers)
+                    raw = response.read()
+                    result = json.loads(raw) if raw else None
+                    return (result, response_headers) if with_headers else result
+            except (OSError, IncompleteRead) as error:
+                if isinstance(error, HTTPError):
+                    self.observe_backoff(error.headers)
+                    error.close()
+                if attempt == retries or not transient_error(error):
+                    raise
+                ceiling = min(30, 2 ** min(attempt, 5))
+                jitter = random.uniform(ceiling / 2, ceiling)
+                now = time.monotonic()
+                self.not_before = max(self.not_before, now + jitter)
+                progress(f"Zotero read interrupted ({type(error).__name__}). "
+                         f"Retry {attempt + 1}/{retries} in {self.not_before - now:.1f}s.")
+
+    def library_items(self):
+        """Read a consistent paginated snapshot, including trash for recovery."""
+        records = {}
+        snapshot_version = None
+        total = None
+        while total is None or len(records) < total:
+            start = len(records)
+            page, headers = self.request(
+                f"/items?includeTrashed=1&limit=100&start={start}", with_headers=True)
+            try:
+                version = int(headers["Last-Modified-Version"])
+                count = int(headers["Total-Results"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise RuntimeError("Zotero did not return pagination/version headers") from error
+            if snapshot_version is None:
+                snapshot_version, total = version, count
+            if version != snapshot_version or count != total or count < 0:
+                raise RuntimeError("Library changed during discovery; rerun the scan")
+            for entry in page:
+                record = entry["data"]
+                records[record["key"]] = record
+            if len(records) != start + len(page) or len(records) > total or (
+                    not page and len(records) < total):
+                raise RuntimeError("Zotero returned inconsistent item pages; rerun the scan")
+            progress(f"Scanned {len(records)}/{total} Zotero items.")
+        return records, snapshot_version
+
+    def write_once(self, path, method, data, version):
+        try:
+            return self.request(path, method, data, version), None
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            progress("Unreadable write response. Checking the server before continuing.")
+            return None, error
+        except (OSError, IncompleteRead) as error:
+            if not transient_error(error):
+                raise
+            progress("Zotero did not acknowledge the write. Checking the server before continuing.")
+            return None, error
+
+    def readback(self, path):
+        try:
+            return self.request(path)
+        except (OSError, IncompleteRead, ValueError) as error:
+            raise RuntimeError("Write could not be verified. Check server state before retrying") from error
+
+    def verify_trashed(self, records, write_error=None):
+        query = urlencode({"itemKey": ",".join(r["key"] for r in records),
+                           "includeTrashed": 1, "limit": len(records)})
+        page = self.readback(f"/items?{query}")
+        try:
+            actual = {entry["data"]["key"]: entry["data"] for entry in page}
+        except (KeyError, TypeError) as error:
+            raise RuntimeError("Unexpected trash readback response; review and resume from the backup") from error
+        pending = [r["key"] for r in records if not already_trashed(r, actual.get(r["key"]))]
+        if pending:
+            raise RuntimeError("Trash readback incomplete for " + ", ".join(pending)
+                               + ". Review and resume from the backup") from write_error
+        return actual
+
+    def trash_notes(self, records, library_version):
+        # Zotero enforces the library precondition only on the first item in a
+        # POST. Use one item per write to guard the retained copy every time.
+        for number, original in enumerate(records, start=1):
+            key = original["key"]
+            progress(f"Moving note {number}/{len(records)} to Zotero trash: {key}")
+            change = {"key": key, "version": original["version"], "deleted": 1}
+            report, error = self.write_once("/items", "POST", [change], library_version)
+            try:
+                fresh = report["successful"]["0"]["data"]
+            except (TypeError, KeyError):
+                fresh = None
+            if not already_trashed(original, fresh):
+                fresh = self.verify_trashed([original], error)[key]
+            # Only advance the guard by our own write. Incorporating a later
+            # unrelated version could hide a change to a retained note.
+            if fresh["version"] != library_version + 1:
+                raise RuntimeError(f"Unexpected version after trashing {key}; review and resume")
+            library_version = fresh["version"]
+
+        for start in range(0, len(records), 50):
+            batch = records[start:start + 50]
+            self.verify_trashed(batch)
+            progress(f"Verified {start + len(batch)}/{len(records)} notes in Zotero trash.")
 
     def item(self, key):
         return self.request(f"/items/{key}")["data"]
@@ -44,11 +211,18 @@ class Zotero:
                 return result
 
     def patch(self, old, changes):
-        self.request(f"/items/{old['key']}", "PATCH", changes, old["version"])
-        fresh = self.item(old["key"])
+        path = f"/items/{old['key']}"
+        _, write_error = self.write_once(path, "PATCH", changes, old["version"])
+        fresh = self.readback(path)["data"]
+        if write_error is not None and (
+                fresh["version"] <= old["version"]
+                or fresh.get("dateAdded") != old.get("dateAdded")
+                or comparable_metadata(fresh) != comparable_metadata(old | changes)
+                or fresh.get("deleted", 0) != changes.get("deleted", old.get("deleted", 0))):
+            raise RuntimeError(f"Write to {old['key']} was not verified; review before retrying") from write_error
         for field, value in changes.items():
             if fresh.get(field) != value:
-                raise RuntimeError(f"Readback mismatch: {old['key']} {field}")
+                raise RuntimeError(f"Readback mismatch: {old['key']} {field}") from write_error
         return fresh
 
 
@@ -59,6 +233,12 @@ def backup(data, path):
         json.dump(data, out, ensure_ascii=False, indent=2)
         out.flush()
         os.fsync(out.fileno())
+    if hasattr(os, "O_DIRECTORY"):
+        directory = os.open(Path(path).parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
 
 def union(values):
@@ -146,6 +326,194 @@ def apply_merge(api, plan, trash):
             api.patch(current, {"deleted": 1})
             print("Trashed", record["key"], flush=True)
 
+
+def bibliographic_parent(record):
+    return (record and not record.get("deleted") and not record.get("parentItem")
+            and record.get("itemType") not in {None, "note", "attachment", "annotation"})
+
+
+def note_families(records, parents=()):
+    families = {}
+    for record in records.values():
+        parent = record.get("parentItem")
+        body = record.get("note")
+        if (record.get("itemType") == "note" and not record.get("deleted")
+                and isinstance(body, str) and bibliographic_parent(records.get(parent))
+                and (not parents or parent in parents)):
+            families.setdefault((parent, body), []).append(record)
+    return families
+
+
+def comparable_metadata(record):
+    """Compare editable data conservatively, ignoring only identity and timestamps."""
+    metadata = {field: value for field, value in record.items()
+                if field not in {"key", "version", "dateAdded", "dateModified", "deleted"}}
+    for field in ("collections", "tags"):
+        metadata[field] = sorted(metadata.get(field, []), key=lambda value: json.dumps(value, sort_keys=True))
+    # Empty relations can be omitted or returned as an empty object.
+    metadata["relations"] = metadata.get("relations") or {}
+    return metadata
+
+
+def already_trashed(original, current):
+    return (isinstance(current, dict) and current.get("deleted") == 1
+            and current.get("key") == original["key"] and type(current.get("version")) is int
+            and current["version"] > original["version"]
+            and current.get("dateAdded") == original.get("dateAdded")
+            and comparable_metadata(current) == comparable_metadata(original))
+
+
+def protected_note_keys(records, group):
+    """Find item references within the visible library, including its trash."""
+    item_uri = re.compile(rf"/groups/{group}/(?:[^/\s]+/)?items/([A-Z0-9]{{8}})(?![A-Za-z0-9])")
+    referenced = set()
+    for record in records.values():
+        parent = record.get("parentItem")
+        if parent:
+            referenced.add(parent)
+        for targets in (record.get("relations") or {}).values():
+            for url in targets if isinstance(targets, list) else [targets]:
+                if isinstance(url, str):
+                    referenced.update(item_uri.findall(url))
+        if record.get("itemType") == "note":
+            referenced.update(item_uri.findall(record.get("note") or ""))
+    return referenced
+
+
+def note_conflict(family, protected):
+    if any(record.get("relations") or record["key"] in protected for record in family):
+        return "existing relationship, item link, or child item"
+    metadata = comparable_metadata(family[0])
+    if any(comparable_metadata(record) != metadata for record in family[1:]):
+        return "same content with conflicting metadata"
+    return None
+
+
+def plan_note_dedup(api, parents):
+    progress("Discovering child-note duplicates.")
+    records, _ = api.library_items()
+    for parent in parents:
+        if not bibliographic_parent(records.get(parent)):
+            raise ValueError(f"Expected an active top-level reference for {parent}")
+    families = note_families(records, set(parents))
+    protected = protected_note_keys(records, api.group)
+    groups = []
+    for (parent, _), family in families.items():
+        if len(family) < 2:
+            continue
+        conflict = note_conflict(family, protected)
+        if conflict:
+            keys = ", ".join(sorted(record["key"] for record in family))
+            print(f"Skipped {parent} ({keys}): {conflict}")
+            continue
+        retained, *redundant = sorted(family, key=lambda r: (r.get("dateAdded") or "", r["key"]))
+        groups.append({"retained": retained, "redundant": redundant})
+    groups.sort(key=lambda g: (g["retained"]["parentItem"], g["retained"]["key"]))
+    return groups
+
+
+def load_note_snapshot(path, group, kind):
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    if (not isinstance(snapshot, dict) or snapshot.get("format") != 1
+            or snapshot.get("group") != group or snapshot.get("kind") != kind
+            or not isinstance(snapshot.get("groups"), list)):
+        raise ValueError(f"Expected a {kind} snapshot for group {group}")
+    seen = set()
+    for family in snapshot["groups"]:
+        if (not isinstance(family, dict) or not isinstance(family.get("redundant"), list)
+                or not family["redundant"]):
+            raise ValueError("Invalid duplicate-note group in snapshot")
+        records = [family.get("retained"), *family["redundant"]]
+        for record in records:
+            if (not isinstance(record, dict) or record.get("itemType") != "note"
+                    or record.get("deleted") or not isinstance(record.get("key"), str)
+                    or not KEY.fullmatch(record["key"])
+                    or not isinstance(record.get("parentItem"), str)
+                    or not KEY.fullmatch(record["parentItem"])
+                    or not isinstance(record.get("note"), str)
+                    or type(record.get("version")) is not int or record["version"] < 1
+                    or record["key"] in seen):
+                raise ValueError("Invalid or repeated note in snapshot")
+            seen.add(record["key"])
+        if note_conflict(records, set()):
+            raise ValueError("Conflicting notes in snapshot")
+    return snapshot["groups"]
+
+
+def validate_note_plan(api, groups, *, resuming):
+    progress(f"Validating {len(groups)} duplicate-note groups against current Zotero state.")
+    records, version = api.library_items()
+    families = note_families(records)
+    protected = protected_note_keys(records, api.group)
+    pending = []
+    for group in groups:
+        retained = group["retained"]
+        parent = retained["parentItem"]
+        if not bibliographic_parent(records.get(parent)) or records.get(retained["key"]) != retained:
+            raise RuntimeError(f"Parent or retained note changed for {retained['key']}; stop and review")
+        family = families[(parent, retained["note"])]
+        if note_conflict(family, protected):
+            raise RuntimeError(f"Conflicting metadata or relationships for {retained['key']}; stop and review")
+        for original in group["redundant"]:
+            key = original["key"]
+            current = records.get(key)
+            if resuming and already_trashed(original, current):
+                progress(f"Already verified in trash: {key}")
+            elif current == original:
+                pending.append(original)
+            else:
+                raise RuntimeError(f"Redundant note {key} changed or disappeared; stop and review")
+    progress(f"Validated {len(pending)} pending notes.")
+    return pending, version
+
+
+def confirm_apply(group):
+    confirmation = f"APPLY {group}"
+    if input(f"Type {confirmation} to confirm: ") != confirmation:
+        raise RuntimeError("Confirmation cancelled")
+
+
+def deduplicate_notes(api, args):
+    if args.from_plan or args.resume:
+        kind = "backup" if args.resume else "plan"
+        groups = load_note_snapshot(args.resume or args.from_plan, api.group, kind)
+    else:
+        groups = plan_note_dedup(api, args.parents)
+
+    count = sum(len(group["redundant"]) for group in groups)
+    for group in groups:
+        retained = group["retained"]
+        redundant = ", ".join(record["key"] for record in group["redundant"])
+        print(f"{retained['parentItem']}: retain {retained['key']}, redundant {redundant}")
+    print(f"{len(groups)} duplicate-note groups, {count} redundant notes.", flush=True)
+    if args.expect and [len(groups), count] != args.expect:
+        raise RuntimeError("Counts differ from --expect; review the preview before proceeding")
+
+    snapshot = {"format": 1, "group": api.group, "kind": "plan",
+                "time": datetime.now(timezone.utc).isoformat(), "groups": groups}
+    if args.save_plan:
+        backup(snapshot, args.save_plan)
+        print("Saved private plan:", args.save_plan)
+    if not args.apply:
+        if args.resume or args.from_plan:
+            validate_note_plan(api, groups, resuming=bool(args.resume))
+        print("Dry run: no changes made.")
+        return
+    if not count:
+        print("No redundant notes to trash.")
+        return
+
+    confirm_apply(api.group)
+    pending, version = validate_note_plan(api, groups, resuming=bool(args.resume))
+    if not pending:
+        print("All planned notes are already verified in trash.")
+        return
+    if not args.resume:
+        snapshot.update(kind="backup", time=datetime.now(timezone.utc).isoformat())
+        backup(snapshot, args.backup)
+        print("Private backup:", args.backup, flush=True)
+    api.trash_notes(pending, version)
+    print("Completed. Snapshot:", args.resume or args.backup)
 
 
 def read_key_byte(fd):
@@ -257,6 +625,8 @@ def masked_key(prompt="Zotero API key: "):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--group", required=True, type=int)
+    parser.add_argument("--timeout", type=float, default=30, help="Request timeout in seconds (default: 30)")
+    parser.add_argument("--max-retries", type=int, default=4, help="Additional read attempts (default: 4)")
     parser.add_argument("--apply", action="store_true", help="Enable confirmed writes")
     parser.add_argument("--backup", type=Path, help="Private JSON audit snapshot path")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -266,14 +636,38 @@ def main():
     note = sub.add_parser("note", help="Update an existing note using HTML from a local file")
     note.add_argument("key")
     note.add_argument("file", type=Path)
+    dedup = sub.add_parser("deduplicate-notes", help="Preview or trash exact duplicate child notes")
+    dedup.add_argument("parents", nargs="*", help="Restrict discovery to these parent reference keys")
+    source = dedup.add_mutually_exclusive_group()
+    source.add_argument("--save-plan", type=Path, help="Write the reviewed dry-run plan to a new private file")
+    source.add_argument("--from-plan", type=Path, help="Use a saved dry-run plan")
+    source.add_argument("--resume", type=Path, help="Reconcile or resume from an existing private backup")
+    dedup.add_argument("--expect", type=int, nargs=2, metavar=("GROUPS", "REDUNDANT"),
+                       help="Require these duplicate-group and redundant-note counts")
     args = parser.parse_args()
-    keys = args.keys if args.command == "merge" else [args.key]
+    if not math.isfinite(args.timeout) or args.timeout <= 0 or args.max_retries < 0:
+        parser.error("--timeout must be positive and finite and --max-retries must be nonnegative")
+    if args.command == "deduplicate-notes":
+        keys = args.parents
+        if keys and (args.from_plan or args.resume):
+            parser.error("Parent keys are only accepted when discovering duplicates")
+        if args.apply and not (args.resume or (args.from_plan and args.backup)):
+            parser.error("Applying note cleanup requires --from-plan and --backup, or --resume")
+        if args.backup and (args.resume or not args.apply):
+            parser.error("--backup is only accepted for a new apply")
+        if args.expect and any(count < 0 for count in args.expect):
+            parser.error("--expect counts must be nonnegative")
+    else:
+        keys = args.keys if args.command == "merge" else [args.key]
     if args.group <= 0 or any(not KEY.fullmatch(k) for k in keys):
         parser.error("Invalid group ID or item key")
     if args.command == "merge" and (len(keys) < 2 or len(set(keys)) != len(keys)):
         parser.error("Supply at least two distinct item keys")
     token = os.environ.get("ZOTERO_API_KEY") or masked_key()
-    api = Zotero(args.group, token)
+    api = Zotero(args.group, token, timeout=args.timeout, max_retries=args.max_retries)
+    if args.command == "deduplicate-notes":
+        deduplicate_notes(api, args)
+        return
     if args.command == "merge":
         plan = plan_merge(api, keys)
         print(json.dumps({"master": keys[0], "duplicates": keys[1:],
@@ -294,8 +688,7 @@ def main():
         return
     if not args.backup:
         parser.error("--apply requires --backup")
-    if input(f"Type APPLY {args.group} to confirm: ") != f"APPLY {args.group}":
-        raise RuntimeError("Confirmation cancelled")
+    confirm_apply(args.group)
     backup({"group": args.group, "time": datetime.now(timezone.utc).isoformat(),
             "plan": plan}, args.backup)
     if args.command == "merge":
@@ -312,7 +705,7 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, EOFError):
         print("Cancelled.", file=sys.stderr)
         sys.exit(1)
-    except (HTTPError, OSError, ValueError, RuntimeError) as exc:
+    except (OSError, IncompleteRead, ValueError, RuntimeError) as exc:
         print(f"Stopped: {exc}. If applying, inspect the backup and server state before retrying.",
               file=sys.stderr)
         sys.exit(1)
