@@ -81,15 +81,21 @@ class Zotero:
             if delay:
                 self.not_before = max(self.not_before, time.monotonic() + delay)
 
-    def request(self, path, method="GET", data=None, version=None, *, with_headers=False):
-        headers = {"Zotero-API-Key": self.token, "Zotero-API-Version": "3"}
+    def request(self, path, method="GET", data=None, version=None, *, with_headers=False,
+                extra_headers=None, raw_response=False, max_response_bytes=None):
+        headers = {"Zotero-API-Version": "3", **(extra_headers or {})}
         if version is not None:
             headers["If-Unmodified-Since-Version"] = str(version)
         payload = None
         if data is not None:
-            headers["Content-Type"] = "application/json"
-            payload = json.dumps(data).encode()
+            if isinstance(data, bytes):
+                payload = data
+            else:
+                headers["Content-Type"] = "application/json"
+                payload = json.dumps(data).encode()
         request = Request(self.base + path, payload, headers, method=method)
+        # Storage downloads may redirect to a signed URL on a different host.
+        request.add_unredirected_header("Zotero-api-key", self.token)
         retries = self.max_retries if method == "GET" else 0
         for attempt in range(retries + 1):
             delay = self.not_before - time.monotonic()
@@ -99,8 +105,11 @@ class Zotero:
                 with urlopen(request, timeout=self.timeout) as response:
                     response_headers = getattr(response, "headers", {})
                     self.observe_backoff(response_headers)
-                    raw = response.read()
-                    result = json.loads(raw) if raw else None
+                    raw = (response.read() if max_response_bytes is None
+                           else response.read(max_response_bytes + 1))
+                    if max_response_bytes is not None and len(raw) > max_response_bytes:
+                        raise ValueError("Zotero response exceeded the expected file size")
+                    result = raw if raw_response else (json.loads(raw) if raw else None)
                     return (result, response_headers) if with_headers else result
             except (OSError, IncompleteRead) as error:
                 if isinstance(error, HTTPError):
