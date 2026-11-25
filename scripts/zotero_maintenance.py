@@ -154,7 +154,7 @@ def masked_key(prompt="Zotero API key: "):
     import termios
     import tty
     try:
-        terminal = open("/dev/tty", "r+", encoding="utf-8", buffering=1)
+        terminal = open("/dev/tty", "w", encoding="utf-8", buffering=1)
     except OSError:
         return getpass.getpass(prompt)
     with terminal:
