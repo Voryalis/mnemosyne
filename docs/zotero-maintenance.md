@@ -73,6 +73,10 @@ python3 scripts/zotero_maintenance.py --group 6757728 --timeout 60 --max-retries
 
 Resume keeps the original backup and skips notes already verified in the trash. If a retained copy, redundant note, or relationship has changed, stop and review the current records and snapshot. If the run ended before backup creation, no trash request was sent. Use the reviewed plan again, or preview a fresh plan if records changed. To undo a completed removal, restore the affected notes from Zotero Trash using the keys in the backup.
 
+### Validation on group 6757728
+
+On 25 November 2026, the preview found 19 duplicate-note groups with 30 redundant notes. The first apply stopped after an unacknowledged write. A read-only recovery check found all 30 notes still pending, and applying from the original backup verified all 30 in Zotero Trash.
+
 This experimental utility requires testing with disposable group records before use on production research. It does not add write tools to ChatGPT; deployment of a write-enabled MCP interface would be separate.
 
 API reference: https://www.zotero.org/support/dev/web_api/v3/write_requests
