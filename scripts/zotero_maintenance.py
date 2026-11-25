@@ -148,7 +148,7 @@ def apply_merge(api, plan, trash):
 
 
 def masked_key(prompt="Zotero API key: "):
-    """Mask ASCII API-key input on POSIX terminals, including pasted input."""
+    """Mask API-key input, accepting normal and bracketed terminal paste."""
     if os.name != "posix":
         return getpass.getpass(prompt)
     import termios
@@ -161,12 +161,24 @@ def masked_key(prompt="Zotero API key: "):
         fd = terminal.fileno()
         original = termios.tcgetattr(fd)
         chars = []
-        terminal.write(prompt)
+        escape = None
+        terminal.write(prompt + "\x1b[?2004h")
         terminal.flush()
         try:
-            tty.setraw(fd)
+            tty.setcbreak(fd)
             while True:
                 byte = os.read(fd, 1)
+                if escape is not None:
+                    escape += byte
+                    if escape in (b"\x1b[200~", b"\x1b[201~"):
+                        escape = None
+                    elif not any(seq.startswith(escape) for seq in
+                                 (b"\x1b[200~", b"\x1b[201~")):
+                        escape = None
+                    continue
+                if byte == b"\x1b":
+                    escape = byte
+                    continue
                 if byte in (b"\r", b"\n"):
                     return "".join(chars)
                 if byte in (b"\x03", b"\x04", b""):
@@ -181,13 +193,12 @@ def masked_key(prompt="Zotero API key: "):
                 elif byte.isalnum():
                     chars.append(byte.decode("ascii"))
                     terminal.write("●")
-                else:
-                    # Reject unexpected characters rather than silently changing a key.
+                elif byte not in (b" ", b"\t"):
                     raise ValueError("Unexpected character in Zotero API key")
                 terminal.flush()
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, original)
-            terminal.write("\n")
+            terminal.write("\x1b[?2004l\n")
             terminal.flush()
 
 
