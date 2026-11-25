@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -147,44 +148,92 @@ def apply_merge(api, plan, trash):
 
 
 
+def read_key_byte(fd):
+    byte = os.read(fd, 1)
+    if byte == b"\x03":
+        raise KeyboardInterrupt
+    if byte in (b"\x04", b""):
+        raise EOFError
+    return byte
+
+
+def read_terminal_escape(fd):
+    """Consume one 7-bit terminal escape and return a bracketed-paste marker."""
+    first = read_key_byte(fd)
+    if first in (b"]", b"P", b"X", b"^", b"_"):
+        # OSC may end with BEL. All control strings can end with ST (ESC \\).
+        previous = b""
+        while True:
+            byte = read_key_byte(fd)
+            if (first == b"]" and byte == b"\x07") or (previous == b"\x1b" and byte == b"\\"):
+                return None
+            if byte in (b"\r", b"\n"):
+                break
+            previous = byte
+    elif first in (b"[", b"O"):
+        # CSI and SS3 can include parameters before the final byte.
+        sequence = bytearray()
+        for _ in range(64):
+            byte = read_key_byte(fd)
+            if b"\x20" <= byte <= b"\x3f":
+                sequence.extend(byte)
+                continue
+            if b"\x40" <= byte <= b"\x7e":
+                if first == b"[" and byte == b"~" and sequence in (b"200", b"201"):
+                    return sequence == b"200"
+                if first == b"[" and not sequence and byte in (b"M", b"["):
+                    # Legacy mouse and function-key reports have extra bytes.
+                    break
+                return None
+            break
+    else:
+        while b"\x20" <= first <= b"\x2f":
+            first = read_key_byte(fd)
+        if b"\x30" <= first <= b"\x7e":
+            return None
+    raise ValueError("Unsupported terminal escape in Zotero API key input")
+
+
+def hidden_key(prompt):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", getpass.GetPassWarning)
+        try:
+            return getpass.getpass(prompt)
+        except getpass.GetPassWarning:
+            raise OSError("A terminal with hidden input or ZOTERO_API_KEY is required") from None
+
+
 def masked_key(prompt="Zotero API key: "):
     """Mask API-key input, accepting normal and bracketed terminal paste."""
     if os.name != "posix":
-        return getpass.getpass(prompt)
+        return hidden_key(prompt)
     import termios
     import tty
     try:
         terminal = open("/dev/tty", "w", encoding="utf-8", buffering=1,
                         opener=lambda path, flags: os.open(path, os.O_RDWR | os.O_NOCTTY))
     except OSError:
-        return getpass.getpass(prompt)
+        return hidden_key(prompt)
     with terminal:
         fd = terminal.fileno()
         original = termios.tcgetattr(fd)
         chars = []
-        escape = None
-        terminal.write(prompt + "\x1b[?2004h")
-        terminal.flush()
+        pasting = False
         try:
-            tty.setcbreak(fd)
+            tty.setraw(fd)
+            terminal.write("\x1b[?2004h" + prompt)
+            terminal.flush()
             while True:
-                byte = os.read(fd, 1)
-                if escape is not None:
-                    escape += byte
-                    if escape in (b"\x1b[200~", b"\x1b[201~"):
-                        escape = None
-                    elif not any(seq.startswith(escape) for seq in
-                                 (b"\x1b[200~", b"\x1b[201~")):
-                        escape = None
-                    continue
+                byte = read_key_byte(fd)
                 if byte == b"\x1b":
-                    escape = byte
+                    marker = read_terminal_escape(fd)
+                    if marker is not None:
+                        pasting = marker
                     continue
                 if byte in (b"\r", b"\n"):
-                    return "".join(chars)
-                if byte in (b"\x03", b"\x04", b""):
-                    raise KeyboardInterrupt
-                if byte in (b"\x08", b"\x7f"):
+                    if not pasting:
+                        return "".join(chars)
+                elif byte in (b"\x08", b"\x7f"):
                     if chars:
                         chars.pop()
                         terminal.write("\b \b")
@@ -198,10 +247,12 @@ def masked_key(prompt="Zotero API key: "):
                     raise ValueError("Unexpected character in Zotero API key")
                 terminal.flush()
         finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, original)
-            terminal.write("\x1b[?2004l\n")
-            terminal.flush()
-
+            try:
+                terminal.write("\x1b[?2004l")
+                terminal.flush()
+            finally:
+                termios.tcsetattr(fd, termios.TCSAFLUSH, original)
+            terminal.write("\n")
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -258,6 +309,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except (KeyboardInterrupt, EOFError):
+        print("Cancelled.", file=sys.stderr)
+        sys.exit(1)
     except (HTTPError, OSError, ValueError, RuntimeError) as exc:
         print(f"Stopped: {exc}. If applying, inspect the backup and server state before retrying.",
               file=sys.stderr)

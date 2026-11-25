@@ -2,7 +2,7 @@
 
 The Java MCP server remains read-only. This standalone Python 3.10+ utility uses the Zotero Web API with a separate write-enabled key. Never commit credentials, backups or private research data.
 
-Create a restricted group-write key at https://www.zotero.org/settings/keys. The utility prompts for the key without echoing it when ZOTERO_API_KEY is unset.
+Create a restricted group-write key at https://www.zotero.org/settings/keys. When `ZOTERO_API_KEY` is unset, the utility prompts for the key with hidden input. On a POSIX terminal, it displays one bullet per character and accepts typing or paste. Press Enter to submit, Backspace to correct a character, or Ctrl+C or Ctrl+D to cancel.
 
 ## Preview a consolidation
 
